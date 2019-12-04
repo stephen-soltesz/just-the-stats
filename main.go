@@ -22,6 +22,9 @@ import (
 	"github.com/stephen-soltesz/pretty"
 )
 
+// TODO: define custom collector to stop reporting metrics for deleted containers.
+
+// PodCurrentPIDs collects pid metrics for running k8s pods.
 var PodCurrentPIDs = promauto.NewGaugeVec(
 	prometheus.GaugeOpts{
 		Name: "docker_pod_process_count",
@@ -50,6 +53,7 @@ func main() {
 		panic(err)
 	}
 
+	// TODO: run list in loop to find new pods.
 	fmt.Println("List:")
 	containers, err := cli.ContainerList(ctx, types.ContainerListOptions{})
 	if err != nil {
@@ -64,6 +68,7 @@ func main() {
 	fmt.Println("Stats:")
 	for _, container := range containers {
 		fmt.Printf("%s %q %q\n", container.Names[0], container.State, container.Status)
+		// TODO: run the stats collection in parallel.
 		// NOTE: each request is delayed about 1 sec to read delta usage stats.
 		resp, err := cli.ContainerStats(ctx, container.ID, false)
 		rtx.Must(err, "Failed to get stats for %q", container.ID)
@@ -86,7 +91,7 @@ func main() {
 			// NOTE: per cpu usage could be used to create histogram heatmap of core usage.
 			// NOTE: throttling data could be used to observe cpu scheduling delays.
 
-			// pretty.Print(v)
+			// TODO: calculate more things.
 			fmt.Printf("%s %d %d %d %d\n",
 				v.Name,
 				v.CPUStats.CPUUsage.TotalUsage-v.PreCPUStats.CPUUsage.TotalUsage,
@@ -95,11 +100,11 @@ func main() {
 				v.PidsStats.Current,
 			)
 			f := strings.Split(v.Name, "_")
-			// 3 2 1
-			PodCurrentPIDs.WithLabelValues(
-				f[3], f[2], f[1],
-			).Set(float64(v.PidsStats.Current))
-			// TODO: calculate more things.
+			if len(f) < 4 {
+				// Ignore non-k8s pod names.
+				continue
+			}
+			PodCurrentPIDs.WithLabelValues(f[3], f[2], f[1]).Set(float64(v.PidsStats.Current))
 		}
 	}
 	<-ctx.Done()
