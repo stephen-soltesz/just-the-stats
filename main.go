@@ -10,6 +10,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/m-lab/go/logx"
+	"github.com/stephen-soltesz/pretty"
+
 	"github.com/m-lab/go/flagx"
 
 	"github.com/m-lab/go/prometheusx"
@@ -22,15 +25,12 @@ import (
 	"github.com/m-lab/go/rtx"
 )
 
-// TODO: define custom collector to stop reporting metrics for deleted containers.
-
-// PodCurrentPIDs collects pid metrics for running k8s pods.
-var PodCurrentPIDs = promauto.NewGaugeVec(
+// NonStandardContainers counts the number of docker containers that do not match the k8s naming pattern.
+var NonStandardContainers = promauto.NewGauge(
 	prometheus.GaugeOpts{
-		Name: "docker_pod_process_count",
-		Help: "Current POD process count",
+		Name: "docker_stats_nonstandard_containers",
+		Help: "Number of containers that did not match the k8s name pattern",
 	},
-	[]string{"namespace", "pod", "container"},
 )
 
 /*
@@ -45,16 +45,40 @@ func main() {
 	rtx.Must(flagx.ArgsFromEnv(flag.CommandLine), "Failed to parse args")
 
 	c := &Collector{
-		metricName: "pod_exporter_process_count",
+		metricPrefix: "docker_stats",
 	}
 	prometheus.MustRegister(c)
-
 	srv := prometheusx.MustServeMetrics()
 	defer srv.Close()
+
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+
+	for ctx.Err() == nil {
+		<-ticker.C
+		c.Update()
+	}
 	<-ctx.Done()
 }
 
-func collect() (map[labels]*types.StatsJSON, error) {
+func filterK8SNames(containers []types.Container) ([]types.Container, int) {
+	var nonstandard int
+	var filtered []types.Container
+	for i := range containers {
+		c := containers[i]
+		f := strings.Split(c.Names[0], "_")
+		if len(f) < 4 || f[0] != "/k8s" {
+			// Count docker container names that do not match k8s pattern.
+			log.Println(f)
+			nonstandard++
+			continue
+		}
+		filtered = append(filtered, c)
+	}
+	return filtered, nonstandard
+}
+
+func collect() (map[*labels]*types.StatsJSON, error) {
 
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
@@ -62,19 +86,20 @@ func collect() (map[labels]*types.StatsJSON, error) {
 		return nil, err
 	}
 
-	// TODO: run list in loop to find new pods.
-	log.Println("List:")
 	containers, err := cli.ContainerList(ctx, types.ContainerListOptions{})
 	if err != nil {
 		return nil, err
 	}
 
-	ret := map[labels]*types.StatsJSON{}
+	filtered, nonstandard := filterK8SNames(containers)
+	NonStandardContainers.Set(float64(nonstandard))
+
+	ret := map[*labels]*types.StatsJSON{}
 	wg := sync.WaitGroup{}
 	lock := sync.Mutex{}
 
-	log.Println("Stats:")
-	for _, container := range containers {
+	log.Println("Collecting stats:")
+	for _, container := range filtered {
 		// NOTE: each request is delayed about 1 sec to read delta usage stats.
 		wg.Add(1)
 		go func(c types.Container) {
@@ -89,52 +114,38 @@ func collect() (map[labels]*types.StatsJSON, error) {
 	return ret, nil
 }
 
-func getStats(cli *client.Client, container types.Container) (labels, *types.StatsJSON) {
-
+func getStats(cli *client.Client, container types.Container) (*labels, *types.StatsJSON) {
+	// Read container stats from docker api.
 	resp, err := cli.ContainerStats(ctx, container.ID, false)
 	rtx.Must(err, "Failed to get stats for %q", container.ID)
 	defer resp.Body.Close()
 
 	var v *types.StatsJSON
-	var t *types.StatsJSON
-	var l labels
 	// Decode the response.
 	dec := json.NewDecoder(resp.Body)
-	for {
-		t = nil
-		if err := dec.Decode(&t); err != nil {
-			// TODO: maybe there's a trick here.
-			if err == io.EOF {
-				break
-			}
-			log.Println("Try again due to:", err)
-			time.Sleep(100 * time.Millisecond)
-			continue
+	if err := dec.Decode(&v); err != nil {
+		if err == io.EOF {
+			log.Printf("Error EOF before decoding response: %q", err)
+			return nil, nil
 		}
-		v = t
-		// NOTE: per cpu usage could be used to create histogram heatmap of core usage.
-		// NOTE: throttling data could be used to observe cpu scheduling delays.
-
-		// TODO: calculate more things.
-		f := strings.Split(v.Name, "_")
-		if len(f) < 4 {
-			// Ignore non-k8s pod names.
-			// TODO: count these.
-			continue
-		}
-		PodCurrentPIDs.WithLabelValues(f[3], f[2], f[1]).Set(float64(v.PidsStats.Current))
-
-		l = labels{
-			Container: f[1],
-			Namespace: f[3],
-			Pod:       f[2],
-		}
-
-		log.Printf("%v %d\n",
-			l,
-			v.PidsStats.Current,
-		)
+		log.Printf("Error decoding response: %q", err)
+		return nil, nil
 	}
+
+	// Only filtered k8s names should have been passed here.
+	f := strings.Split(v.Name, "_")
+	if len(f) < 4 || f[0] != "/k8s" {
+		log.Printf("ERROR: container name does not match k8s naming pattern: %q", v.Name)
+		return nil, nil
+	}
+	l := &labels{
+		Container: f[1],
+		Namespace: f[3],
+		Pod:       f[2],
+	}
+
+	logx.Debug.Println(pretty.Sprint(v))
+	log.Printf("%v %d %d\n", *l, v.PidsStats.Current, v.MemoryStats.Stats["total_rss"])
 	return l, v
 }
 
@@ -146,10 +157,10 @@ type labels struct {
 
 // Collector manages a prometheus.Collector for queries performed by a QueryRunner.
 type Collector struct {
-	// metricName is the base name for prometheus metrics created for this query.
-	metricName string
+	// metricPrefix is the base name for prometheus metrics created for this query.
+	metricPrefix string
 
-	metrics map[labels]*types.StatsJSON
+	metrics map[*labels]*types.StatsJSON
 
 	// descs maps metric suffixes to the prometheus description. These descriptions
 	// are generated once and must be stable over time.
@@ -160,11 +171,9 @@ type Collector struct {
 }
 
 // NewCollector creates a new BigQuery Collector instance.
-func NewCollector(metricName string) *Collector {
+func NewCollector(metricPrefix string) *Collector {
 	return &Collector{
-		metricName: metricName,
-		descs:      nil,
-		mux:        sync.Mutex{},
+		metricPrefix: metricPrefix,
 	}
 }
 
@@ -172,7 +181,7 @@ func NewCollector(metricName string) *Collector {
 // immediately after registering the collector.
 func (col *Collector) Describe(ch chan<- *prometheus.Desc) {
 	if col.descs == nil {
-		col.descs = make(map[string]*prometheus.Desc, 1)
+		// col.descs = make([]*prometheus.Desc)
 		err := col.Update()
 		if err != nil {
 			log.Println(err)
@@ -189,29 +198,28 @@ func (col *Collector) Describe(ch chan<- *prometheus.Desc) {
 // from cached metrics.
 func (col *Collector) Collect(ch chan<- prometheus.Metric) {
 	col.mux.Lock()
-	var err error
-	col.metrics, err = collect()
-	if err != nil {
-		log.Println(err)
-		return
-	}
 	// Get reference to current metrics slice to allow Update to run concurrently.
 	metrics := col.metrics
 	col.mux.Unlock()
 
 	for l, stats := range metrics {
-		for _, desc := range col.descs {
-			ch <- prometheus.MustNewConstMetric(
-				desc, prometheus.GaugeValue,
-				float64(stats.PidsStats.Current),
-				[]string{l.Container, l.Namespace, l.Pod}...)
-		}
+		// NOTE: per cpu usage could be used to create histogram heatmap of core usage.
+		// NOTE: throttling data could be used to observe cpu saturation.
+		ch <- prometheus.MustNewConstMetric(
+			col.descs["pidstats_current"], prometheus.GaugeValue,
+			float64(stats.PidsStats.Current),
+			[]string{l.Container, l.Namespace, l.Pod}...)
+		ch <- prometheus.MustNewConstMetric(
+			col.descs["memorystats_total_rss"], prometheus.GaugeValue,
+			float64(stats.MemoryStats.Stats["total_rss"]),
+			[]string{l.Container, l.Namespace, l.Pod}...)
+
 	}
 }
 
 // String satisfies the Stringer interface. String returns the metric name.
 func (col *Collector) String() string {
-	return col.metricName
+	return col.metricPrefix
 }
 
 // Update runs the collector query and atomically updates the cached metrics.
@@ -226,7 +234,9 @@ func (col *Collector) setDesc() {
 	// The query may return no results.
 	if len(col.metrics) > 0 {
 		// TODO: allow passing meaningful help text.
-		col.descs["PidsStats.Current"] =
-			prometheus.NewDesc(col.metricName, "help text", []string{"container", "namespace", "pod"}, nil)
+		col.descs = map[string]*prometheus.Desc{
+			"pidstats_current":      prometheus.NewDesc(col.metricPrefix+"_pidstats_current", "Docker PidStats.Current", []string{"container", "namespace", "pod"}, nil),
+			"memorystats_total_rss": prometheus.NewDesc(col.metricPrefix+"_memorystats_total_rss", "Docker MemoryStats.Stats['total_rss']", []string{"container", "namespace", "pod"}, nil),
+		}
 	}
 }
