@@ -9,13 +9,12 @@ import (
 	"sync"
 
 	"github.com/m-lab/go/logx"
+	"github.com/m-lab/go/rtx"
 	"github.com/stephen-soltesz/pretty"
 
+	"github.com/docker/docker/api/types"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-
-	"github.com/docker/docker/api/types"
-	"github.com/m-lab/go/rtx"
 )
 
 // NonStandardContainers counts the number of docker containers that do not match the k8s naming pattern.
@@ -30,6 +29,13 @@ var NonStandardContainers = promauto.NewGauge(
 type Client interface {
 	ContainerList(ctx context.Context, options types.ContainerListOptions) ([]types.Container, error)
 	ContainerStats(ctx context.Context, containerID string, stream bool) (types.ContainerStats, error)
+}
+
+// UpdateCollector is an interface for a prometheus collector that needs periodic updates.
+type UpdateCollector interface {
+	Describe(ch chan<- *prometheus.Desc)
+	Collect(ch chan<- prometheus.Metric)
+	Update(ctx context.Context)
 }
 
 // Collector manages a prometheus.Collector for queries performed by a QueryRunner.
@@ -52,7 +58,7 @@ type Collector struct {
 }
 
 // NewCollector creates a new BigQuery Collector instance.
-func NewCollector(client Client) *Collector {
+func NewCollector(client Client) UpdateCollector {
 	return &Collector{
 		metricPrefix: "docker_stats",
 		client:       client,
@@ -101,11 +107,6 @@ func (c *Collector) Update(ctx context.Context) {
 	c.mux.Lock()
 	c.metrics = metrics
 	c.mux.Unlock()
-}
-
-// String satisfies the Stringer interface. String returns the metric name.
-func (c *Collector) String() string {
-	return c.metricPrefix
 }
 
 type labels struct {

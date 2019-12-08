@@ -9,8 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types"
 	"github.com/m-lab/go/rtx"
+
+	"github.com/docker/docker/api/types"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -108,9 +109,6 @@ func TestNewCollector(t *testing.T) {
 				stats:      tt.stats,
 			}
 			c := NewCollector(fc)
-			if c.String() != "docker_stats" {
-				t.Errorf("String() got %q, want 'docker_stats'", c.String())
-			}
 			dch := make(chan<- *prometheus.Desc, 2)
 			c.Describe(dch)
 			if len(dch) != tt.wantSize {
