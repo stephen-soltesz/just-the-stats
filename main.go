@@ -5,19 +5,25 @@ import (
 	"flag"
 	"time"
 
-	"github.com/stephen-soltesz/just-the-stats/stats"
+	"github.com/docker/docker/api/types"
 
 	"github.com/m-lab/go/flagx"
+	"github.com/m-lab/go/prometheusx"
+	"github.com/m-lab/go/rtx"
+	"github.com/stephen-soltesz/just-the-stats/stats"
 
 	"github.com/docker/docker/client"
-	"github.com/m-lab/go/prometheusx"
-
 	"github.com/prometheus/client_golang/prometheus"
-
-	"github.com/m-lab/go/rtx"
 )
 
-var ctx = context.Background()
+var mainCtx, mainCancel = context.WithCancel(context.Background())
+var updateDelay time.Duration
+
+func init() {
+	flag.DurationVar(&updateDelay, "update", time.Minute, "")
+}
+
+var newCollector = stats.NewCollector
 
 func main() {
 	flag.Parse()
@@ -25,19 +31,20 @@ func main() {
 
 	c, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	rtx.Must(err, "Failed to allocate Docker client")
+	c.ContainerList(mainCtx, types.ContainerListOptions{})
 
-	col := stats.NewCollector(c)
+	col := newCollector(c) // stats.NewCollector(c)
 	prometheus.MustRegister(col)
 
 	srv := prometheusx.MustServeMetrics()
 	defer srv.Close()
 
-	ticker := time.NewTicker(time.Minute)
+	ticker := time.NewTicker(updateDelay)
 	defer ticker.Stop()
 
-	for ctx.Err() == nil {
+	for mainCtx.Err() == nil {
 		<-ticker.C
-		col.Update(ctx)
+		col.Update(mainCtx)
 	}
-	<-ctx.Done()
+	<-mainCtx.Done()
 }
