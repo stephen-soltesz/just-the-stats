@@ -16,14 +16,15 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-var mainCtx, mainCancel = context.WithCancel(context.Background())
-var updateDelay time.Duration
+var (
+	updateDelay         time.Duration
+	newCollector        = stats.NewCollector
+	mainCtx, mainCancel = context.WithCancel(context.Background())
+)
 
 func init() {
 	flag.DurationVar(&updateDelay, "update", time.Minute, "")
 }
-
-var newCollector = stats.NewCollector
 
 func main() {
 	flag.Parse()
@@ -33,7 +34,7 @@ func main() {
 	rtx.Must(err, "Failed to allocate Docker client")
 	c.ContainerList(mainCtx, types.ContainerListOptions{})
 
-	col := newCollector(c) // stats.NewCollector(c)
+	col := newCollector(c)
 	prometheus.MustRegister(col)
 
 	srv := prometheusx.MustServeMetrics()
