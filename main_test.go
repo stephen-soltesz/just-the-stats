@@ -37,5 +37,5 @@ func Test_main(t *testing.T) {
 	}()
 
 	main()
-
+	// No hang equals success.
 }
