@@ -47,5 +47,4 @@ func main() {
 		<-ticker.C
 		col.Update(mainCtx)
 	}
-	<-mainCtx.Done()
 }
